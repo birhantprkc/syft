@@ -137,6 +137,8 @@ var (
 
 	errNotUPX               = errors.New("not a UPX-compressed binary")
 	errUnsupportedUPXMethod = errors.New("unsupported UPX compression method")
+	errUPXBlockTooLarge     = errors.New("UPX block uncompressed size exceeds declared block size")
+	errUPXOutputExceeded    = errors.New("UPX blocks decompress to more than the declared original size")
 )
 
 // upxInfo contains parsed UPX header information
@@ -253,6 +255,12 @@ func decompressUPX(r io.ReaderAt) (io.ReaderAt, error) {
 	outputOffset := uint64(0)
 	blockNum := 0
 
+	// UPX packs the original file as a series of blocks, each at most p_blocksize, that together
+	// reconstruct p_filesize. Track the unclaimed remainder so the block headers cannot drive more
+	// decompression than the file itself declares: without this, every block may individually claim
+	// the whole original size, and the total work becomes (block count x original size).
+	remaining := info.originalSize
+
 	// track PT_LOAD segment offsets for proper block placement
 	var ptLoadOffsets []uint64
 
@@ -274,6 +282,18 @@ func decompressUPX(r io.ReaderAt) (io.ReaderAt, error) {
 			}
 			break
 		}
+
+		// a single block cannot exceed the packer's declared block size, and all blocks together cannot
+		// exceed the declared original size. Both are checked before the sizes below reach an allocation.
+		if block.uncompressedSize > info.blockSize {
+			return nil, fmt.Errorf("%w: %d > %d", errUPXBlockTooLarge, block.uncompressedSize, info.blockSize)
+		}
+		if block.uncompressedSize > remaining {
+			return nil, fmt.Errorf("%w: block %d claims %d with %d left of %d",
+				errUPXOutputExceeded, blockNum+1, block.uncompressedSize, remaining, info.originalSize)
+		}
+		remaining -= block.uncompressedSize
+
 		blockNum++
 
 		decompressor, ok := upxDecompressors[block.method]
