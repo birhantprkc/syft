@@ -143,7 +143,13 @@ func getBuildInfo(r io.ReaderAt, location file.Location) (bi *debug.BuildInfo, e
 	if isUPXCompressed(r) {
 		log.WithFields("path", location.RealPath).Trace("detected UPX-compressed Go binary, attempting decompression to read the build info")
 		decompressed, decompErr := decompressUPX(r)
-		if decompErr == nil {
+		if decompErr != nil {
+			// surface why decompression was refused; without this the size and layout guards in upx.go
+			// reject a malformed file with no signal at any log level, and the caller reports only the
+			// original buildinfo error
+			log.WithFields("path", location.RealPath, "error", decompErr).
+				Trace("unable to decompress UPX-compressed Go binary")
+		} else {
 			bi, err = buildinfo.Read(decompressed)
 			if err == nil {
 				return bi, nil

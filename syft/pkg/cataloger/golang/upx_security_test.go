@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+	"time"
+
+	"github.com/anchore/syft/syft/file"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -148,7 +151,7 @@ func TestParseELFPTLoadOffsets_OverflowPhoffNoPanic(t *testing.T) {
 // range, along with the payload set that drives block 3 to that offset.
 func buildPoisonELF(t *testing.T) []byte {
 	t.Helper()
-	phdrs := make([]byte, 112) // two ELF64 program headers
+	phdrs := make([]byte, 112)                                      // two ELF64 program headers
 	binary.LittleEndian.PutUint32(phdrs[0:4], 1)                    // phdr[0] PT_LOAD
 	binary.LittleEndian.PutUint64(phdrs[8:16], 0)                   // p_offset 0
 	binary.LittleEndian.PutUint32(phdrs[56:60], 1)                  // phdr[1] PT_LOAD
@@ -264,4 +267,35 @@ func TestParseUPXInfo_RatioAllowsRealisticExpansion(t *testing.T) {
 	info, err := parseUPXInfo(bytes.NewReader(data))
 	require.NoError(t, err)
 	assert.Equal(t, uint32(4096), info.originalSize)
+}
+
+// TestGetBuildInfo_MaliciousUPXRejected exercises the entry point the reported vulnerability was reachable
+// through. The unit tests above call decompressUPX directly; this one goes through getBuildInfo, which is
+// what parseGoBinary uses and what the default-enabled go-module-binary-cataloger reaches.
+func TestGetBuildInfo_MaliciousUPXRejected(t *testing.T) {
+	// a plausible ELF prefix so the file looks like an executable, then a UPX header whose single block
+	// claims the full uint32 range. Pre-fix this reached make([]byte, 0xFFFFFFFF).
+	elf := make([]byte, 64)
+	copy(elf, []byte{0x7f, 'E', 'L', 'F'})
+	elf[4] = 2
+
+	data := append(elf, buildUPXFile(t, 4096, 4096,
+		[][]byte{bytes.Repeat([]byte("A"), 32)}, []uint32{0xFFFFFFFF})...)
+
+	require.True(t, isUPXCompressed(bytes.NewReader(data)), "fixture must reach the UPX path")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bi, err := getBuildInfo(bytes.NewReader(data), file.NewLocation("/malicious"))
+		// no packages, and an error rather than a panic or a fatal allocation
+		assert.Nil(t, bi)
+		assert.Error(t, err)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("getBuildInfo did not return promptly on a malicious UPX file")
+	}
 }
