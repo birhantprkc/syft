@@ -85,7 +85,9 @@ func TestParseUPXInfo_ValidHeader(t *testing.T) {
 	}
 
 	data := append(append(lInfo, pInfo...), bInfo...)
-	data = append(data, make([]byte, 100)...) // padding
+	// pad past p_filesize/maxUPXExpansionRatio so the declared 1MB is plausible for the input size;
+	// parseUPXInfo rejects a claim this large from a ~100 byte file
+	data = append(data, make([]byte, 0x100000/maxUPXExpansionRatio)...)
 
 	reader := bytes.NewReader(data)
 	info, err := parseUPXInfo(reader)

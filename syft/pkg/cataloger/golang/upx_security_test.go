@@ -243,3 +243,25 @@ func TestParseUPXInfo_ImplausibleHeader(t *testing.T) {
 		})
 	}
 }
+
+func TestParseUPXInfo_OriginalSizeBoundedByInputSize(t *testing.T) {
+	// the absolute ceiling is unrelated to the file on disk, so on its own a few dozen header bytes can
+	// claim it. This is the amplification the reporter measured, expressed as a ratio rather than an
+	// absolute size.
+	data := append(buildUPXHeader(maxUPXOriginalSize, 4096), make([]byte, 32)...)
+
+	_, err := parseUPXInfo(bytes.NewReader(data))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUPXImplausibleSize)
+}
+
+func TestParseUPXInfo_RatioAllowsRealisticExpansion(t *testing.T) {
+	// a claim within the ratio must still parse. The real fixture expands 1.96x; 4x here stays well inside
+	// the bound so a legitimately compressible binary is not rejected.
+	data := append(buildUPXHeader(4096, 4096), make([]byte, 1024)...)
+	require.Greater(t, len(data), 4096/maxUPXExpansionRatio)
+
+	info, err := parseUPXInfo(bytes.NewReader(data))
+	require.NoError(t, err)
+	assert.Equal(t, uint32(4096), info.originalSize)
+}

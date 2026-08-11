@@ -131,6 +131,18 @@ const (
 	upxFilterCTO uint8 = 0x49 // CTO (call trick optimization) filter for x86/x64
 )
 
+// bounds on what a UPX header may claim before we act on it
+const (
+	// maxUPXOriginalSize is the absolute ceiling on p_filesize, used when the input size is unknown.
+	maxUPXOriginalSize = 500 * 1024 * 1024
+
+	// maxUPXExpansionRatio bounds p_filesize against the actual input size, which the absolute ceiling
+	// alone does not do. The image-small-upx fixture, a real `upx --best --lzma` build, expands 1.96x, so
+	// this leaves wide margin for a more compressible binary while keeping a few dozen header bytes from
+	// claiming the ceiling above.
+	maxUPXExpansionRatio = 128
+)
+
 var (
 	// upxMagic is the magic bytes that identify a UPX-packed binary
 	upxMagic = []byte("UPX!")
@@ -140,6 +152,7 @@ var (
 	errUPXBlockTooLarge     = errors.New("UPX block uncompressed size exceeds declared block size")
 	errUPXOutputExceeded    = errors.New("UPX blocks decompress to more than the declared original size")
 	errUPXBlockOutOfRange   = errors.New("UPX block placement falls outside the output buffer")
+	errUPXImplausibleSize   = errors.New("UPX declared original size is implausible for the input size")
 )
 
 // upxInfo contains parsed UPX header information
@@ -406,6 +419,33 @@ func parseELFPTLoadOffsets(elfHeader []byte) []uint64 {
 	return offsets
 }
 
+// inputSize reports the size of the underlying input when it can be determined without consuming it.
+// Callers treat a false result as "unknown" and fall back to the absolute ceiling.
+func inputSize(r io.ReaderAt) (int64, bool) {
+	if s, ok := r.(interface{ Size() int64 }); ok {
+		return s.Size(), true
+	}
+
+	s, ok := r.(io.Seeker)
+	if !ok {
+		return 0, false
+	}
+
+	// restore the offset afterwards; ReadAt does not depend on it, but the reader is shared with the caller
+	cur, err := s.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, false
+	}
+	end, err := s.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, false
+	}
+	if _, err := s.Seek(cur, io.SeekStart); err != nil {
+		return 0, false
+	}
+	return end, true
+}
+
 // parseUPXInfo locates and parses the UPX header information
 func parseUPXInfo(r io.ReaderAt) (*upxInfo, error) {
 	// scan for the UPX! magic in the first 8KB
@@ -460,8 +500,16 @@ func parseUPXInfo(r io.ReaderAt) (*upxInfo, error) {
 	// the magic is found by an unanchored substring scan, so a stray "UPX!" in unrelated data (e.g. a
 	// string constant) can be read as a header. Require the fields a real UPX header always sets to be
 	// plausible before decompressing: non-zero version, format, block size, and a bounded original size.
-	if info.originalSize == 0 || info.originalSize > 500*1024*1024 {
+	if info.originalSize == 0 || info.originalSize > maxUPXOriginalSize {
 		return nil, fmt.Errorf("invalid original size: %d", info.originalSize)
+	}
+
+	// the absolute ceiling above is not related to the file on disk, so on its own it lets a few dozen
+	// header bytes claim the full ceiling. Bound the claim by the actual input size as well: division
+	// rather than multiplication so the comparison cannot overflow on a large input.
+	if size, ok := inputSize(r); ok && int64(info.originalSize)/maxUPXExpansionRatio > size {
+		return nil, fmt.Errorf("%w: p_filesize %d exceeds %dx the %d byte input",
+			errUPXImplausibleSize, info.originalSize, maxUPXExpansionRatio, size)
 	}
 	if info.version == 0 || info.format == 0 || info.blockSize == 0 {
 		return nil, fmt.Errorf("implausible UPX header (version=%d format=%d blockSize=%d)", info.version, info.format, info.blockSize)
