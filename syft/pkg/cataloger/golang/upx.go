@@ -457,9 +457,14 @@ func parseUPXInfo(r io.ReaderAt) (*upxInfo, error) {
 		firstBlockOff: int64(magicIdx + 8 + 12), // magic + l_info remainder + p_info
 	}
 
-	// sanity check
+	// the magic is found by an unanchored substring scan, so a stray "UPX!" in unrelated data (e.g. a
+	// string constant) can be read as a header. Require the fields a real UPX header always sets to be
+	// plausible before decompressing: non-zero version, format, block size, and a bounded original size.
 	if info.originalSize == 0 || info.originalSize > 500*1024*1024 {
 		return nil, fmt.Errorf("invalid original size: %d", info.originalSize)
+	}
+	if info.version == 0 || info.format == 0 || info.blockSize == 0 {
+		return nil, fmt.Errorf("implausible UPX header (version=%d format=%d blockSize=%d)", info.version, info.format, info.blockSize)
 	}
 
 	return info, nil

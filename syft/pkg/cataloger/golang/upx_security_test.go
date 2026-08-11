@@ -186,3 +186,26 @@ func TestDecompressUPX_OutOfRangePlacementDoesNotPoisonLaterBlocks(t *testing.T)
 	assert.ErrorIs(t, err, errUPXBlockOutOfRange)
 	require.Nil(t, out)
 }
+
+func TestParseUPXInfo_ImplausibleHeader(t *testing.T) {
+	// a coincidental "UPX!" match surrounded by zeroed fields must not be accepted as a real UPX header.
+	build := func(version, format byte, blockSize uint32) []byte {
+		lInfo := []byte{0, 0, 0, 0, 'U', 'P', 'X', '!', 0, 0, version, format}
+		pInfo := make([]byte, 12)
+		binary.LittleEndian.PutUint32(pInfo[4:8], 0x1000) // plausible p_filesize
+		binary.LittleEndian.PutUint32(pInfo[8:12], blockSize)
+		return append(append(append([]byte{}, lInfo...), pInfo...), make([]byte, 32)...)
+	}
+
+	cases := map[string][]byte{
+		"zero version":    build(0, 22, 0x1000),
+		"zero format":     build(14, 0, 0x1000),
+		"zero block size": build(14, 22, 0),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseUPXInfo(bytes.NewReader(data))
+			require.Error(t, err)
+		})
+	}
+}
