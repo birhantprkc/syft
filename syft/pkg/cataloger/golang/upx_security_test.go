@@ -91,8 +91,8 @@ func TestDecompressUPX_MaxUint32BlockSizeRejected(t *testing.T) {
 func TestDecompressUPX_CumulativeExceedsOriginalSize(t *testing.T) {
 	// each block individually fits within p_blocksize, but together they claim more than the file's
 	// declared original size. Without the running remainder every block may claim the full size and the
-	// total decompression work becomes (block count x original size).
-	// real 2048-byte streams, so the failure below is the budget and not a short decode
+	// total decompression work becomes (block count x original size). The streams are real 2048-byte
+	// payloads so the failure below is the budget and not a short decode.
 	payload := bytes.Repeat([]byte("A"), 2048)
 	data := buildUPXFile(t, 4096, 2048, [][]byte{payload, payload, payload}, nil) // 3 x 2048 > 4096
 
@@ -109,4 +109,80 @@ func TestDecompressUPX_BudgetAllowsExactlyOriginalSize(t *testing.T) {
 
 	_, err := decompressUPX(bytes.NewReader(data))
 	require.NoError(t, err)
+}
+
+// buildELF64 assembles a minimal ELF64 header followed by the given program-header bytes.
+func buildELF64(phoff uint64, phentsize, phnum uint16, phdrs []byte) []byte {
+	hdr := make([]byte, 64)
+	copy(hdr, []byte{0x7f, 'E', 'L', 'F'})
+	hdr[4] = 2 // ELFCLASS64
+	binary.LittleEndian.PutUint64(hdr[0x20:0x28], phoff)
+	binary.LittleEndian.PutUint16(hdr[0x36:0x38], phentsize)
+	binary.LittleEndian.PutUint16(hdr[0x38:0x3a], phnum)
+	return append(hdr, phdrs...)
+}
+
+func TestParseELFPTLoadOffsets_ShortPhentsizeNoPanic(t *testing.T) {
+	// a program-header entry smaller than an ELF64 phdr would let the fixed-offset p_offset read run past
+	// the entry; the parser must reject it rather than index out of range.
+	phdr := []byte{1, 0, 0, 0, 0, 0, 0, 0} // ptype = PT_LOAD, only 8 bytes
+	elf := buildELF64(64, 8, 1, phdr)
+
+	require.NotPanics(t, func() {
+		assert.Empty(t, parseELFPTLoadOffsets(elf))
+	})
+}
+
+func TestParseELFPTLoadOffsets_OverflowPhoffNoPanic(t *testing.T) {
+	// a phoff near the top of the uint64 range must not overflow the bounds check into a huge slice index.
+	phdr := make([]byte, 56)
+	binary.LittleEndian.PutUint32(phdr[0:4], 1) // PT_LOAD
+	elf := buildELF64(0xFFFFFFFFFFFFFFF0, 56, 1, phdr)
+
+	require.NotPanics(t, func() {
+		assert.Empty(t, parseELFPTLoadOffsets(elf))
+	})
+}
+
+// buildPoisonELF returns an ELF whose second PT_LOAD segment declares p_offset at the top of the uint64
+// range, along with the payload set that drives block 3 to that offset.
+func buildPoisonELF(t *testing.T) []byte {
+	t.Helper()
+	phdrs := make([]byte, 112) // two ELF64 program headers
+	binary.LittleEndian.PutUint32(phdrs[0:4], 1)                    // phdr[0] PT_LOAD
+	binary.LittleEndian.PutUint64(phdrs[8:16], 0)                   // p_offset 0
+	binary.LittleEndian.PutUint32(phdrs[56:60], 1)                  // phdr[1] PT_LOAD
+	binary.LittleEndian.PutUint64(phdrs[64:72], 0xFFFFFFFFFFFFFFFF) // p_offset at the uint64 ceiling
+	elf := buildELF64(64, 56, 2, phdrs)
+
+	// sanity: the crafted offset really is parsed out, so the tests below exercise the placement guard
+	require.Equal(t, []uint64{0, 0xFFFFFFFFFFFFFFFF}, parseELFPTLoadOffsets(elf))
+	return elf
+}
+
+func TestDecompressUPX_OutOfRangePlacementRejected(t *testing.T) {
+	// block 3 is directed at a p_offset past the end of the output buffer. That means the file does not
+	// describe the layout it claims, so decompression must fail rather than silently drop the block.
+	elf := buildPoisonELF(t)
+	payloads := [][]byte{elf, bytes.Repeat([]byte("B"), 32), bytes.Repeat([]byte("C"), 32)}
+	data := buildUPXFile(t, 8192, 8192, payloads, nil)
+
+	_, err := decompressUPX(bytes.NewReader(data))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUPXBlockOutOfRange)
+}
+
+func TestDecompressUPX_OutOfRangePlacementDoesNotPoisonLaterBlocks(t *testing.T) {
+	// regression: the placement guard used to skip the copy and fall through, but outputOffset is derived
+	// from the rejected destOffset. With p_offset at the uint64 ceiling and a 1-byte block 3, outputOffset
+	// wrapped to 0, and block 4 was then copied over the reconstructed ELF header at offset 0.
+	elf := buildPoisonELF(t)
+	attacker := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 8)
+	payloads := [][]byte{elf, bytes.Repeat([]byte("B"), 32), {0x41}, attacker}
+	data := buildUPXFile(t, 8192, 8192, payloads, nil)
+
+	out, err := decompressUPX(bytes.NewReader(data))
+	require.Error(t, err, "must not report success on a file whose layout was rejected")
+	assert.ErrorIs(t, err, errUPXBlockOutOfRange)
+	require.Nil(t, out)
 }

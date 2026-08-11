@@ -139,6 +139,7 @@ var (
 	errUnsupportedUPXMethod = errors.New("unsupported UPX compression method")
 	errUPXBlockTooLarge     = errors.New("UPX block uncompressed size exceeds declared block size")
 	errUPXOutputExceeded    = errors.New("UPX blocks decompress to more than the declared original size")
+	errUPXBlockOutOfRange   = errors.New("UPX block placement falls outside the output buffer")
 )
 
 // upxInfo contains parsed UPX header information
@@ -235,7 +236,7 @@ func isUPXCompressed(r io.ReaderAt) bool {
 //     ptLoadOffsets := parseELFPTLoadOffsets(block1Data)
 //
 // - Block 1: placed at offset 0 (contains ELF header + program headers)
-// - Block 2: placed at offset 0 (overwrites/extends)
+// - Block 2: placed immediately after block 1 (running outputOffset, not offset 0)
 // - Block 3+: placed at ptLoadOffsets[blockNum-2]
 //
 // Why this matters: Simply concatenating decompressed blocks produces invalid output.
@@ -331,10 +332,17 @@ func decompressUPX(r io.ReaderAt) (io.ReaderAt, error) {
 			destOffset = ptLoadOffsets[blockNum-2]
 		}
 
-		// copy block data to output at correct offset
-		if destOffset+uint64(len(blockData)) <= uint64(len(output)) {
-			copy(output[destOffset:], blockData)
+		// place the block. destOffset comes from an ELF p_offset in the file, so the bounds check uses
+		// subtraction to avoid a uint64 overflow slipping an out-of-range offset past a destOffset+len
+		// test. An out-of-range offset means the file does not describe the layout it claims, so reject
+		// it: skipping the copy here would leave a zero-filled hole and, because outputOffset is derived
+		// from destOffset below, would carry the bad offset into every later block's placement.
+		outLen := uint64(len(output))
+		if destOffset > outLen || uint64(len(blockData)) > outLen-destOffset {
+			return nil, fmt.Errorf("%w: block %d at offset %d exceeds output size %d",
+				errUPXBlockOutOfRange, blockNum, destOffset, outLen)
 		}
+		copy(output[destOffset:], blockData)
 
 		outputOffset = destOffset + uint64(block.uncompressedSize)
 		currentOffset = block.dataOffset + int64(block.compressedSize)
@@ -365,10 +373,23 @@ func parseELFPTLoadOffsets(elfHeader []byte) []uint64 {
 	phentsize := binary.LittleEndian.Uint16(elfHeader[0x36:0x38])
 	phnum := binary.LittleEndian.Uint16(elfHeader[0x38:0x3a])
 
+	const elf64PhdrSize = 56 // fixed size of an ELF64 program header entry
+
+	// the reads below use fixed offsets up to byte 16 of each entry, so a shorter entry must not be
+	// accepted. Loop-invariant, so it is checked once here rather than per iteration.
+	if phentsize < elf64PhdrSize {
+		return nil
+	}
+
+	hdrLen := uint64(len(elfHeader))
 	var offsets []uint64
 	for i := range phnum {
 		phStart := phoff + uint64(i)*uint64(phentsize)
-		if phStart+uint64(phentsize) > uint64(len(elfHeader)) {
+		// subtraction form so a large phoff cannot overflow phStart+phentsize past the buffer end.
+		// note: the `break` is load-bearing for that argument. It guarantees phoff <= hdrLen before any
+		// i >= 1 is reached, which is what keeps phStart itself from wrapping; a `continue` here would
+		// let phoff near 2^64 wrap into a small in-range phStart and read a bogus p_offset.
+		if phStart > hdrLen || hdrLen-phStart < uint64(phentsize) {
 			break
 		}
 
