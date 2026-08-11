@@ -495,7 +495,9 @@ func readBlockInfo(r io.ReaderAt, offset int64) (*blockInfo, error) {
 	return block, nil
 }
 
-// nextPowerOf2 returns the smallest power of 2 >= n
+// nextPowerOf2 returns the smallest power of 2 >= n, saturating at 2^31 since anything larger overflows
+// uint32. Callers must tolerate a result below n above that point; the only caller clamps to maxDictSize
+// well beneath it. Defensive: the block bound in decompressUPX keeps n under 2^31 today.
 func nextPowerOf2(n uint32) uint32 {
 	if n == 0 {
 		return 1
@@ -503,6 +505,10 @@ func nextPowerOf2(n uint32) uint32 {
 	// if already a power of 2, return it
 	if n&(n-1) == 0 {
 		return n
+	}
+	// above 2^31 the next power of two overflows uint32; saturate instead of wrapping back to zero
+	if n > 1<<31 {
+		return 1 << 31
 	}
 	// find the highest set bit and shift left by 1
 	n--
@@ -532,6 +538,12 @@ func decompressLZMA(compressedData []byte, uncompressedSize uint32) ([]byte, err
 	pb := compressedData[0] & 0x07
 	lp := compressedData[1] >> 4
 	lc := compressedData[1] & 0x0f
+
+	// the header nibbles can hold values outside the LZMA ranges; reject them rather than fold them into
+	// the props byte, where the uint8 math below would wrap and mis-decode
+	if lc > 8 || lp > 4 || pb > 4 {
+		return nil, fmt.Errorf("invalid LZMA parameters (lc=%d lp=%d pb=%d)", lc, lp, pb)
+	}
 
 	// convert to standard LZMA properties byte
 	props := lc + lp*9 + pb*9*5

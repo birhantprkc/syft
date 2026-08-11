@@ -187,6 +187,40 @@ func TestDecompressUPX_OutOfRangePlacementDoesNotPoisonLaterBlocks(t *testing.T)
 	require.Nil(t, out)
 }
 
+func TestNextPowerOf2(t *testing.T) {
+	cases := []struct{ in, want uint32 }{
+		{0, 1},
+		{1, 1},
+		{3, 4},
+		{1 << 20, 1 << 20},
+		{(1 << 20) + 1, 1 << 21},
+		{1 << 31, 1 << 31},
+		{(1 << 31) + 1, 1 << 31}, // saturates rather than wrapping to 0
+		{0xFFFFFFFF, 1 << 31},    // saturates rather than wrapping to 0
+	}
+	for _, c := range cases {
+		assert.Equalf(t, c.want, nextPowerOf2(c.in), "nextPowerOf2(%d)", c.in)
+	}
+}
+
+func TestDecompressLZMA_RoundTrip(t *testing.T) {
+	// happy path: a stream built with valid LZMA parameters round-trips (and confirms the parameter
+	// validation does not reject legitimate values).
+	data := bytes.Repeat([]byte("hello UPX "), 16)
+	got, err := decompressLZMA(buildUPXLZMAStream(t, data), uint32(len(data)))
+	require.NoError(t, err)
+	assert.Equal(t, data, got)
+}
+
+func TestDecompressLZMA_InvalidParams(t *testing.T) {
+	// pb encoded as 7 is outside the LZMA-permitted range; it must be rejected rather than wrapped into a
+	// bogus props byte via uint8 arithmetic.
+	stream := []byte{0x07, 0x03, 0x00, 0x00} // byte 0 low bits => pb = 7
+	_, err := decompressLZMA(stream, 32)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid LZMA parameters")
+}
+
 func TestParseUPXInfo_ImplausibleHeader(t *testing.T) {
 	// a coincidental "UPX!" match surrounded by zeroed fields must not be accepted as a real UPX header.
 	build := func(version, format byte, blockSize uint32) []byte {
