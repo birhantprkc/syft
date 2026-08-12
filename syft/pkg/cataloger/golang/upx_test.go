@@ -85,9 +85,6 @@ func TestParseUPXInfo_ValidHeader(t *testing.T) {
 	}
 
 	data := append(append(lInfo, pInfo...), bInfo...)
-	// pad past p_filesize/maxUPXExpansionRatio so the declared 1MB is plausible for the input size;
-	// parseUPXInfo rejects a claim this large from a ~100 byte file
-	data = append(data, make([]byte, 0x100000/maxUPXExpansionRatio)...)
 
 	reader := bytes.NewReader(data)
 	info, err := parseUPXInfo(reader)
@@ -110,7 +107,7 @@ func TestDecompressUPX_UnsupportedMethod(t *testing.T) {
 	pInfo := []byte{
 		0, 0, 0, 0, // p_progid
 		0x00, 0x01, 0x00, 0x00, // p_filesize = 256 bytes (small for test)
-		0, 0, 0x10, 0, // p_blocksize
+		0x00, 0x01, 0x00, 0x00, // p_blocksize = 256 (UPX never sets this above p_filesize)
 	}
 
 	bInfo := []byte{

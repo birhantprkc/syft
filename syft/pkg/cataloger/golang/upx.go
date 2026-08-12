@@ -117,9 +117,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/ulikunitz/xz/lzma"
+
+	"github.com/anchore/syft/internal/log"
 )
+
+// upxMagicScanWindow is how far into the file the "UPX!" magic is searched for. UPX places l_info
+// just past the ELF headers and its loader stub, so this covers real output with room to spare.
+const upxMagicScanWindow = 8192
 
 // UPX compression method constants
 const (
@@ -133,14 +140,23 @@ const (
 
 // bounds on what a UPX header may claim before we act on it
 const (
-	// maxUPXOriginalSize is the absolute ceiling on p_filesize, used when the input size is unknown.
+	// maxUPXOriginalSize is the ceiling on p_filesize, and with the per-block budget in decompressUPX
+	// it is what bounds the total work a header can drive. Deliberately not a ratio against the input
+	// size: LZMA encodes a run of N identical bytes in O(log N) bytes, so a legitimate binary embedding
+	// a large compressible asset expands by hundreds of times (a `go:embed` of 120MB of zeros packs to
+	// 609KB, a 209x ratio), while an attacker only has to pad to defeat any ratio we could pick.
 	maxUPXOriginalSize = 500 * 1024 * 1024
 
-	// maxUPXExpansionRatio bounds p_filesize against the actual input size, which the absolute ceiling
-	// alone does not do. The image-small-upx fixture, a real `upx --best --lzma` build, expands 1.96x, so
-	// this leaves wide margin for a more compressible binary while keeping a few dozen header bytes from
-	// claiming the ceiling above.
-	maxUPXExpansionRatio = 128
+	// maxUPXBlocks bounds the block loop. Real UPX emits one block for the ELF headers plus one per
+	// PT_LOAD extent, so single digits; this leaves room for an unusual layout while keeping a file
+	// from driving unbounded iterations with minimum-size blocks.
+	maxUPXBlocks = 1024
+
+	// maxUPXLZMALiteralBits caps lc+lp. The decoder allocates and initializes a 0x300<<(lc+lp) entry
+	// probability array per block, independent of block size, so the 12 that LZMA's own per-field
+	// limits permit costs 6.3MB of memset for a one-byte block. UPX emits lc+lp of 3 or less, so this
+	// bound is well clear of real output while cutting that cost by 16x.
+	maxUPXLZMALiteralBits = 8
 )
 
 var (
@@ -151,8 +167,12 @@ var (
 	errUnsupportedUPXMethod = errors.New("unsupported UPX compression method")
 	errUPXBlockTooLarge     = errors.New("UPX block uncompressed size exceeds declared block size")
 	errUPXOutputExceeded    = errors.New("UPX blocks decompress to more than the declared original size")
-	errUPXBlockOutOfRange   = errors.New("UPX block placement falls outside the output buffer")
-	errUPXImplausibleSize   = errors.New("UPX declared original size is implausible for the input size")
+	errUPXImplausibleHeader = errors.New("implausible UPX header")
+	errUPXInvalidLZMAParams = errors.New("invalid LZMA parameters")
+
+	// errUPXDecompress marks a file that carries a plausible UPX header but could not be decompressed.
+	// Callers use it to tell "packed binary we failed to read" apart from "not a Go binary".
+	errUPXDecompress = errors.New("unable to decompress UPX-compressed Go binary")
 )
 
 // upxInfo contains parsed UPX header information
@@ -175,8 +195,11 @@ type blockInfo struct {
 	dataOffset       int64
 }
 
-// upxDecompressor is a function that decompresses data using a specific method
-type upxDecompressor func(compressedData []byte, uncompressedSize uint32) ([]byte, error)
+// upxDecompressor decompresses compressedData into dst, which the caller has already sized to the
+// block's declared uncompressed size and bounds-checked against the output buffer. Writing into a
+// caller-owned slice rather than returning a fresh one is what keeps a single block from doubling
+// peak memory; implementations must fill dst exactly and must not grow it.
+type upxDecompressor func(compressedData, dst []byte) error
 
 // upxDecompressors maps compression methods to their decompressor functions
 var upxDecompressors = map[uint8]upxDecompressor{
@@ -227,11 +250,10 @@ func unfilter49(data []byte, cto8 byte) {
 	}
 }
 
-// isUPXCompressed checks if the reader contains a UPX-compressed binary
+// isUPXCompressed checks if the reader contains a UPX-compressed binary. Uses the same window as
+// parseUPXInfo so detection and parsing cannot disagree about whether a file is UPX.
 func isUPXCompressed(r io.ReaderAt) bool {
-	// UPX magic can be at various offsets depending on the binary format
-	// scan the first 4KB for the magic bytes
-	buf := make([]byte, 4096)
+	buf := make([]byte, upxMagicScanWindow)
 	n, err := r.ReadAt(buf, 0)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false
@@ -262,7 +284,11 @@ func decompressUPX(r io.ReaderAt) (io.ReaderAt, error) {
 		return nil, err
 	}
 
-	// allocate buffer for the full decompressed output
+	// the dominant allocation on this path, bounded by parseUPXInfo. Blocks decode directly into slices
+	// of this buffer rather than into a per-block buffer that is then copied, which is what keeps a
+	// single block from doubling peak memory. What is also live during a decode: the LZMA decoder's
+	// dictionary (up to 128MB, see maxDictSize) and the compressed block being read (up to 16MB, sz_cpr
+	// is masked to 24 bits).
 	output := make([]byte, info.originalSize)
 
 	currentOffset := info.firstBlockOff
@@ -278,7 +304,7 @@ func decompressUPX(r io.ReaderAt) (io.ReaderAt, error) {
 	// track PT_LOAD segment offsets for proper block placement
 	var ptLoadOffsets []uint64
 
-	for {
+	for blockNum < maxUPXBlocks {
 		block, err := readBlockInfo(r, currentOffset)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read block info at offset %d: %w", currentOffset, err)
@@ -289,54 +315,20 @@ func decompressUPX(r io.ReaderAt) (io.ReaderAt, error) {
 			break
 		}
 
-		// non-LZMA method on first block is an error; on subsequent blocks it indicates end of data
-		if block.method != upxMethodLZMA {
+		// an unknown method on the first block is an error; on a later block it marks the end of data
+		decompressor, ok := upxDecompressors[block.method]
+		if !ok {
 			if blockNum == 0 {
 				return nil, fmt.Errorf("%w: method %d", errUnsupportedUPXMethod, block.method)
 			}
 			break
 		}
 
-		// a single block cannot exceed the packer's declared block size, and all blocks together cannot
-		// exceed the declared original size. Both are checked before the sizes below reach an allocation.
-		if block.uncompressedSize > info.blockSize {
-			return nil, fmt.Errorf("%w: %d > %d", errUPXBlockTooLarge, block.uncompressedSize, info.blockSize)
-		}
-		if block.uncompressedSize > remaining {
-			return nil, fmt.Errorf("%w: block %d claims %d with %d left of %d",
-				errUPXOutputExceeded, blockNum+1, block.uncompressedSize, remaining, info.originalSize)
+		if err := validateBlock(info, block, remaining, blockNum); err != nil {
+			return nil, err
 		}
 		remaining -= block.uncompressedSize
-
 		blockNum++
-
-		decompressor, ok := upxDecompressors[block.method]
-		if !ok {
-			return nil, fmt.Errorf("%w: method %d", errUnsupportedUPXMethod, block.method)
-		}
-
-		// read compressed data for this block
-		compressedData := make([]byte, block.compressedSize)
-		_, err = r.ReadAt(compressedData, block.dataOffset)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read compressed data: %w", err)
-		}
-
-		// decompress this block
-		blockData, err := decompressor(compressedData, block.uncompressedSize)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decompress block: %w", err)
-		}
-
-		// apply CTO filter reversal if needed
-		if block.filterID == upxFilterCTO {
-			unfilter49(blockData, block.filterCTO)
-		}
-
-		// first block contains ELF headers - parse PT_LOAD segments for subsequent blocks
-		if blockNum == 1 {
-			ptLoadOffsets = parseELFPTLoadOffsets(blockData)
-		}
 
 		// determine where to place this block in the output
 		destOffset := outputOffset
@@ -345,23 +337,75 @@ func decompressUPX(r io.ReaderAt) (io.ReaderAt, error) {
 			destOffset = ptLoadOffsets[blockNum-2]
 		}
 
-		// place the block. destOffset comes from an ELF p_offset in the file, so the bounds check uses
-		// subtraction to avoid a uint64 overflow slipping an out-of-range offset past a destOffset+len
-		// test. An out-of-range offset means the file does not describe the layout it claims, so reject
-		// it: skipping the copy here would leave a zero-filled hole and, because outputOffset is derived
-		// from destOffset below, would carry the bad offset into every later block's placement.
-		outLen := uint64(len(output))
-		if destOffset > outLen || uint64(len(blockData)) > outLen-destOffset {
-			return nil, fmt.Errorf("%w: block %d at offset %d exceeds output size %d",
-				errUPXBlockOutOfRange, blockNum, destOffset, outLen)
+		dst, ok := blockDest(output, destOffset, block.uncompressedSize)
+		if !ok {
+			// the file does not describe the layout it claims. Keep the blocks placed so far rather than
+			// discarding them, since earlier blocks are often enough to recover .go.buildinfo, but stop:
+			// outputOffset derives from destOffset, so continuing would carry the bad offset forward.
+			log.WithFields("block", blockNum, "offset", destOffset, "outputSize", len(output)).
+				Trace("UPX block placement out of range, using partial output")
+			break
 		}
-		copy(output[destOffset:], blockData)
+
+		if err := decompressBlock(r, block, decompressor, dst); err != nil {
+			return nil, err
+		}
+
+		// first block contains ELF headers - parse PT_LOAD segments for subsequent blocks
+		if blockNum == 1 {
+			ptLoadOffsets = parseELFPTLoadOffsets(dst)
+		}
 
 		outputOffset = destOffset + uint64(block.uncompressedSize)
 		currentOffset = block.dataOffset + int64(block.compressedSize)
 	}
 
 	return bytes.NewReader(output), nil
+}
+
+// validateBlock rejects a b_info whose declared sizes are inconsistent with the file header, before
+// those sizes are used to size any read or slice.
+func validateBlock(info *upxInfo, block *blockInfo, remaining uint32, blockNum int) error {
+	// p_blocksize is bounded by p_filesize in parseUPXInfo, so this is a real ceiling and not a
+	// comparison between two attacker-chosen values.
+	if block.uncompressedSize > info.blockSize {
+		return fmt.Errorf("%w: %d > %d", errUPXBlockTooLarge, block.uncompressedSize, info.blockSize)
+	}
+	// the blocks together reconstruct p_filesize, so the running remainder bounds the total work.
+	if block.uncompressedSize > remaining {
+		return fmt.Errorf("%w: block %d claims %d with %d left of %d",
+			errUPXOutputExceeded, blockNum+1, block.uncompressedSize, remaining, info.originalSize)
+	}
+	return nil
+}
+
+// blockDest returns the slice of output that a block of the given size occupies at destOffset, or
+// false if it does not fit. destOffset comes from an ELF p_offset in the file, so the check is written
+// as a subtraction to keep a uint64 overflow from slipping an out-of-range offset past destOffset+size.
+func blockDest(output []byte, destOffset uint64, size uint32) ([]byte, bool) {
+	outLen := uint64(len(output))
+	if destOffset > outLen || uint64(size) > outLen-destOffset {
+		return nil, false
+	}
+	return output[destOffset : destOffset+uint64(size)], true
+}
+
+// decompressBlock reads one block's compressed data and decodes it into dst, reversing the CTO filter
+// if the block declares one.
+func decompressBlock(r io.ReaderAt, block *blockInfo, decompressor upxDecompressor, dst []byte) error {
+	compressedData := make([]byte, block.compressedSize)
+	if _, err := r.ReadAt(compressedData, block.dataOffset); err != nil {
+		return fmt.Errorf("failed to read compressed data: %w", err)
+	}
+
+	if err := decompressor(compressedData, dst); err != nil {
+		return fmt.Errorf("failed to decompress block: %w", err)
+	}
+
+	if block.filterID == upxFilterCTO {
+		unfilter49(dst, block.filterCTO)
+	}
+	return nil
 }
 
 // parseELFPTLoadOffsets extracts PT_LOAD segment file offsets from ELF headers.
@@ -419,37 +463,9 @@ func parseELFPTLoadOffsets(elfHeader []byte) []uint64 {
 	return offsets
 }
 
-// inputSize reports the size of the underlying input when it can be determined without consuming it.
-// Callers treat a false result as "unknown" and fall back to the absolute ceiling.
-func inputSize(r io.ReaderAt) (int64, bool) {
-	if s, ok := r.(interface{ Size() int64 }); ok {
-		return s.Size(), true
-	}
-
-	s, ok := r.(io.Seeker)
-	if !ok {
-		return 0, false
-	}
-
-	// restore the offset afterwards; ReadAt does not depend on it, but the reader is shared with the caller
-	cur, err := s.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, false
-	}
-	end, err := s.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, false
-	}
-	if _, err := s.Seek(cur, io.SeekStart); err != nil {
-		return 0, false
-	}
-	return end, true
-}
-
 // parseUPXInfo locates and parses the UPX header information
 func parseUPXInfo(r io.ReaderAt) (*upxInfo, error) {
-	// scan for the UPX! magic in the first 8KB
-	buf := make([]byte, 8192)
+	buf := make([]byte, upxMagicScanWindow)
 	n, err := r.ReadAt(buf, 0)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("failed to read header: %w", err)
@@ -499,20 +515,21 @@ func parseUPXInfo(r io.ReaderAt) (*upxInfo, error) {
 
 	// the magic is found by an unanchored substring scan, so a stray "UPX!" in unrelated data (e.g. a
 	// string constant) can be read as a header. Require the fields a real UPX header always sets to be
-	// plausible before decompressing: non-zero version, format, block size, and a bounded original size.
+	// plausible before any of them is used to size an allocation.
+	if info.version == 0 || info.format == 0 {
+		// l_version is the packheader version (11-14 in the wild) and l_format is a UPX_F_* id starting
+		// at 1, so neither is ever zero in real output.
+		return nil, fmt.Errorf("%w: version=%d format=%d", errUPXImplausibleHeader, info.version, info.format)
+	}
 	if info.originalSize == 0 || info.originalSize > maxUPXOriginalSize {
-		return nil, fmt.Errorf("invalid original size: %d", info.originalSize)
+		return nil, fmt.Errorf("%w: p_filesize %d exceeds the %d byte ceiling",
+			errUPXImplausibleHeader, info.originalSize, maxUPXOriginalSize)
 	}
-
-	// the absolute ceiling above is not related to the file on disk, so on its own it lets a few dozen
-	// header bytes claim the full ceiling. Bound the claim by the actual input size as well: division
-	// rather than multiplication so the comparison cannot overflow on a large input.
-	if size, ok := inputSize(r); ok && int64(info.originalSize)/maxUPXExpansionRatio > size {
-		return nil, fmt.Errorf("%w: p_filesize %d exceeds %dx the %d byte input",
-			errUPXImplausibleSize, info.originalSize, maxUPXExpansionRatio, size)
-	}
-	if info.version == 0 || info.format == 0 || info.blockSize == 0 {
-		return nil, fmt.Errorf("implausible UPX header (version=%d format=%d blockSize=%d)", info.version, info.format, info.blockSize)
+	// UPX sets p_blocksize from the largest PT_LOAD p_filesz, so it is always within the original file.
+	// Without this the per-block check in validateBlock would compare two attacker-chosen values.
+	if info.blockSize == 0 || info.blockSize > info.originalSize {
+		return nil, fmt.Errorf("%w: p_blocksize %d with p_filesize %d",
+			errUPXImplausibleHeader, info.blockSize, info.originalSize)
 	}
 
 	return info, nil
@@ -543,9 +560,7 @@ func readBlockInfo(r io.ReaderAt, offset int64) (*blockInfo, error) {
 	return block, nil
 }
 
-// nextPowerOf2 returns the smallest power of 2 >= n, saturating at 2^31 since anything larger overflows
-// uint32. Callers must tolerate a result below n above that point; the only caller clamps to maxDictSize
-// well beneath it. Defensive: the block bound in decompressUPX keeps n under 2^31 today.
+// nextPowerOf2 returns the smallest power of 2 >= n, saturating at 2^31 rather than overflowing to 0.
 func nextPowerOf2(n uint32) uint32 {
 	if n == 0 {
 		return 1
@@ -554,7 +569,6 @@ func nextPowerOf2(n uint32) uint32 {
 	if n&(n-1) == 0 {
 		return n
 	}
-	// above 2^31 the next power of two overflows uint32; saturate instead of wrapping back to zero
 	if n > 1<<31 {
 		return 1 << 31
 	}
@@ -577,9 +591,9 @@ func nextPowerOf2(n uint32) uint32 {
 //   - Byte 2+: raw LZMA stream (starts with 0x00 for range decoder init)
 //
 // Standard LZMA props encoding: props = lc + lp*9 + pb*9*5
-func decompressLZMA(compressedData []byte, uncompressedSize uint32) ([]byte, error) {
+func decompressLZMA(compressedData, dst []byte) error {
 	if len(compressedData) < 3 {
-		return nil, fmt.Errorf("compressed data too short")
+		return fmt.Errorf("compressed data too short")
 	}
 
 	// parse UPX's 2-byte LZMA header
@@ -588,9 +602,13 @@ func decompressLZMA(compressedData []byte, uncompressedSize uint32) ([]byte, err
 	lc := compressedData[1] & 0x0f
 
 	// the header nibbles can hold values outside the LZMA ranges; reject them rather than fold them into
-	// the props byte, where the uint8 math below would wrap and mis-decode
+	// the props byte, where the uint8 math below would wrap and mis-decode. lc+lp is capped separately
+	// because it sets the size of a probability array the decoder allocates per block.
 	if lc > 8 || lp > 4 || pb > 4 {
-		return nil, fmt.Errorf("invalid LZMA parameters (lc=%d lp=%d pb=%d)", lc, lp, pb)
+		return fmt.Errorf("%w: lc=%d lp=%d pb=%d", errUPXInvalidLZMAParams, lc, lp, pb)
+	}
+	if uint16(lc)+uint16(lp) > maxUPXLZMALiteralBits {
+		return fmt.Errorf("%w: lc+lp=%d exceeds %d", errUPXInvalidLZMAParams, lc+lp, maxUPXLZMALiteralBits)
 	}
 
 	// convert to standard LZMA properties byte
@@ -598,6 +616,8 @@ func decompressLZMA(compressedData []byte, uncompressedSize uint32) ([]byte, err
 
 	// raw LZMA stream starts at byte 2 (includes 0x00 init byte)
 	lzmaStream := compressedData[2:]
+
+	uncompressedSize := uint32(len(dst))
 
 	// compute dictionary size: must be at least as large as uncompressed size
 	// use next power of 2 for efficiency, with reasonable min/max bounds.
@@ -613,21 +633,15 @@ func decompressLZMA(compressedData []byte, uncompressedSize uint32) ([]byte, err
 	binary.LittleEndian.PutUint32(header[1:5], dictSize)
 	binary.LittleEndian.PutUint64(header[5:13], uint64(uncompressedSize))
 
-	// combine header + raw stream
-	var fullStream []byte
-	fullStream = append(fullStream, header...)
-	fullStream = append(fullStream, lzmaStream...)
-
-	reader, err := lzma.NewReader(bytes.NewReader(fullStream))
+	reader, err := lzma.NewReader(bytes.NewReader(slices.Concat(header, lzmaStream)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create LZMA reader: %w", err)
+		return fmt.Errorf("failed to create LZMA reader: %w", err)
 	}
 
-	decompressed := make([]byte, uncompressedSize)
-	_, err = io.ReadFull(reader, decompressed)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress LZMA data: %w", err)
+	// dst is a slice of the caller's output buffer, sized to the block's declared uncompressed size
+	if _, err := io.ReadFull(reader, dst); err != nil {
+		return fmt.Errorf("failed to decompress LZMA data: %w", err)
 	}
 
-	return decompressed, nil
+	return nil
 }

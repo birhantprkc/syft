@@ -2,6 +2,7 @@ package golang
 
 import (
 	"debug/buildinfo"
+	"errors"
 	"fmt"
 	"io"
 	"runtime/debug"
@@ -37,6 +38,11 @@ func scanFile(location file.Location, reader unionreader.UnionReader, captureSym
 		bi, err := getBuildInfo(r, location)
 		if err != nil {
 			log.WithFields("file", location.RealPath, "error", err).Trace("unable to read golang buildinfo")
+			if errors.Is(err, errUPXDecompress) {
+				// a packed Go binary we could not unpack means its packages are missing from the SBOM.
+				// Every other failure here is usually just "not a Go binary", which is not worth reporting.
+				errs = unknown.Appendf(errs, location, "unable to read golang buildinfo: %w", err)
+			}
 
 			continue
 		}
@@ -141,19 +147,12 @@ func getBuildInfo(r io.ReaderAt, location file.Location) (bi *debug.BuildInfo, e
 	// if direct read fails and this looks like a UPX-compressed binary,
 	// try to decompress and read the buildinfo from the decompressed data
 	if isUPXCompressed(r) {
-		log.WithFields("path", location.RealPath).Trace("detected UPX-compressed Go binary, attempting decompression to read the build info")
-		decompressed, decompErr := decompressUPX(r)
-		if decompErr != nil {
-			// surface why decompression was refused; without this the size and layout guards in upx.go
-			// reject a malformed file with no signal at any log level, and the caller reports only the
-			// original buildinfo error
-			log.WithFields("path", location.RealPath, "error", decompErr).
-				Trace("unable to decompress UPX-compressed Go binary")
-		} else {
-			bi, err = buildinfo.Read(decompressed)
-			if err == nil {
-				return bi, nil
-			}
+		upxBI, upxErr := buildInfoFromUPX(r, location)
+		if upxErr != nil {
+			return nil, upxErr
+		}
+		if upxBI != nil {
+			return upxBI, nil
 		}
 	}
 
@@ -170,4 +169,38 @@ func getBuildInfo(r io.ReaderAt, location file.Location) (bi *debug.BuildInfo, e
 		return bi, err
 	}
 	return bi, err
+}
+
+// buildInfoFromUPX decompresses a UPX-packed binary and reads its build info.
+//
+// A nil result with a nil error means the file is not really UPX-packed (the magic matched unrelated
+// data) or simply is not Go, so the caller should fall through to its normal handling. A non-nil error
+// means the file does look packed and could not be read, which is a gap in the SBOM rather than a file
+// to skip quietly.
+func buildInfoFromUPX(r io.ReaderAt, location file.Location) (*debug.BuildInfo, error) {
+	log.WithFields("path", location.RealPath).
+		Trace("detected UPX-compressed Go binary, attempting decompression to read the build info")
+
+	decompressed, err := decompressUPX(r)
+	if err != nil {
+		// a stray "UPX!" in unrelated data (a string constant, say) lands here. That is not a packed
+		// binary, so it must not be reported as one.
+		if errors.Is(err, errNotUPX) || errors.Is(err, errUPXImplausibleHeader) {
+			log.WithFields("path", location.RealPath, "error", err).
+				Trace("UPX magic did not belong to a real UPX header")
+			return nil, nil
+		}
+		// the header was plausible and decompression still failed, so whatever this file contains is not
+		// going to be cataloged. Wrap it in a sentinel the caller turns into an unknown: the bare
+		// buildinfo error here is "not a Go executable", which is deliberately silenced above.
+		return nil, fmt.Errorf("%w: %w", errUPXDecompress, err)
+	}
+
+	bi, err := buildinfo.Read(decompressed)
+	if err != nil {
+		log.WithFields("path", location.RealPath, "error", err).
+			Trace("unable to read build info from the decompressed UPX binary")
+		return nil, nil
+	}
+	return bi, nil
 }

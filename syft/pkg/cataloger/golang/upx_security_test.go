@@ -3,14 +3,14 @@ package golang
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
-	"time"
-
-	"github.com/anchore/syft/syft/file"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/ulikunitz/xz/lzma"
+
+	"github.com/anchore/syft/syft/file"
 )
 
 // buildUPXLZMAStream encodes data into the compressed-block form decompressLZMA expects: UPX's custom
@@ -72,6 +72,15 @@ func buildUPXFile(t *testing.T, originalSize, blockSize uint32, payloads [][]byt
 	return append(data, make([]byte, 12)...) // end marker: sz_unc == 0
 }
 
+// readAll drains an io.ReaderAt returned by decompressUPX.
+func readAll(t *testing.T, r io.ReaderAt) []byte {
+	t.Helper()
+	require.NotNil(t, r)
+	out, err := io.ReadAll(io.NewSectionReader(r, 0, 1<<62))
+	require.NoError(t, err)
+	return out
+}
+
 func TestDecompressUPX_BlockExceedsDeclaredBlockSize(t *testing.T) {
 	// a block claiming more than the packer's own p_blocksize is malformed. This is the value the
 	// reporter's proof-of-concept drove to 0x80000000 to size an unbounded allocation.
@@ -112,6 +121,23 @@ func TestDecompressUPX_BudgetAllowsExactlyOriginalSize(t *testing.T) {
 
 	_, err := decompressUPX(bytes.NewReader(data))
 	require.NoError(t, err)
+}
+
+func TestDecompressUPX_BlockCountBounded(t *testing.T) {
+	// without a cap the block loop runs until the budget is spent one byte at a time, so a small file can
+	// drive hundreds of millions of iterations. Each block here places a single byte sequentially, so the
+	// number of blocks actually processed is directly observable in the output.
+	const blocks = maxUPXBlocks + 76
+	payloads := make([][]byte, blocks)
+	for i := range payloads {
+		payloads[i] = []byte("A")
+	}
+	data := buildUPXFile(t, 4096, 4096, payloads, nil)
+
+	out, err := decompressUPX(bytes.NewReader(data))
+	require.NoError(t, err, "the cap stops the loop, it does not fail the file")
+	assert.Equal(t, maxUPXBlocks, bytes.Count(readAll(t, out), []byte("A")),
+		"exactly maxUPXBlocks blocks should have been placed")
 }
 
 // buildELF64 assembles a minimal ELF64 header followed by the given program-header bytes.
@@ -163,31 +189,35 @@ func buildPoisonELF(t *testing.T) []byte {
 	return elf
 }
 
-func TestDecompressUPX_OutOfRangePlacementRejected(t *testing.T) {
-	// block 3 is directed at a p_offset past the end of the output buffer. That means the file does not
-	// describe the layout it claims, so decompression must fail rather than silently drop the block.
+func TestDecompressUPX_OutOfRangePlacementStopsWithPartialOutput(t *testing.T) {
+	// block 3 is directed at a p_offset past the end of the output buffer. The blocks placed before it are
+	// often enough to recover .go.buildinfo, so they are kept, but the loop must stop rather than continue
+	// from a bad offset.
 	elf := buildPoisonELF(t)
 	payloads := [][]byte{elf, bytes.Repeat([]byte("B"), 32), bytes.Repeat([]byte("C"), 32)}
 	data := buildUPXFile(t, 8192, 8192, payloads, nil)
 
-	_, err := decompressUPX(bytes.NewReader(data))
-	require.Error(t, err)
-	assert.ErrorIs(t, err, errUPXBlockOutOfRange)
+	out, err := decompressUPX(bytes.NewReader(data))
+	require.NoError(t, err)
+	got := readAll(t, out)
+	assert.Equal(t, elf, got[:len(elf)], "block 1 stays placed")
+	assert.NotContains(t, string(got), "CCCC", "the out-of-range block is not placed")
 }
 
 func TestDecompressUPX_OutOfRangePlacementDoesNotPoisonLaterBlocks(t *testing.T) {
 	// regression: the placement guard used to skip the copy and fall through, but outputOffset is derived
 	// from the rejected destOffset. With p_offset at the uint64 ceiling and a 1-byte block 3, outputOffset
-	// wrapped to 0, and block 4 was then copied over the reconstructed ELF header at offset 0.
+	// wrapped to 0, and block 4 was then written over the reconstructed ELF header at offset 0.
 	elf := buildPoisonELF(t)
 	attacker := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 8)
 	payloads := [][]byte{elf, bytes.Repeat([]byte("B"), 32), {0x41}, attacker}
 	data := buildUPXFile(t, 8192, 8192, payloads, nil)
 
 	out, err := decompressUPX(bytes.NewReader(data))
-	require.Error(t, err, "must not report success on a file whose layout was rejected")
-	assert.ErrorIs(t, err, errUPXBlockOutOfRange)
-	require.Nil(t, out)
+	require.NoError(t, err)
+	got := readAll(t, out)
+	assert.Equal(t, []byte{0x7f, 'E', 'L', 'F'}, got[:4], "the ELF header must not be overwritten")
+	assert.NotContains(t, string(got), string(attacker), "the block after a bad offset is not placed")
 }
 
 func TestNextPowerOf2(t *testing.T) {
@@ -210,63 +240,107 @@ func TestDecompressLZMA_RoundTrip(t *testing.T) {
 	// happy path: a stream built with valid LZMA parameters round-trips (and confirms the parameter
 	// validation does not reject legitimate values).
 	data := bytes.Repeat([]byte("hello UPX "), 16)
-	got, err := decompressLZMA(buildUPXLZMAStream(t, data), uint32(len(data)))
-	require.NoError(t, err)
-	assert.Equal(t, data, got)
+	dst := make([]byte, len(data))
+	require.NoError(t, decompressLZMA(buildUPXLZMAStream(t, data), dst))
+	assert.Equal(t, data, dst)
 }
 
 func TestDecompressLZMA_InvalidParams(t *testing.T) {
-	// pb encoded as 7 is outside the LZMA-permitted range; it must be rejected rather than wrapped into a
-	// bogus props byte via uint8 arithmetic.
-	stream := []byte{0x07, 0x03, 0x00, 0x00} // byte 0 low bits => pb = 7
-	_, err := decompressLZMA(stream, 32)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid LZMA parameters")
+	// the header nibbles can hold values the LZMA props byte cannot represent. Rejecting them keeps the
+	// uint8 props arithmetic from wrapping into a valid-looking but wrong value.
+	cases := map[string][]byte{
+		// byte 0 low 3 bits carry pb; byte 1 is (lp<<4)|lc
+		"pb above range":     {0x07, 0x03, 0x00, 0x00}, // pb = 7
+		"lc above range":     {0x02, 0x0f, 0x00, 0x00}, // lc = 15
+		"lp above range":     {0x02, 0x53, 0x00, 0x00}, // lp = 5
+		"lc+lp above budget": {0x02, 0x48, 0x00, 0x00}, // lc = 8, lp = 4, sum = 12
+	}
+	for name, stream := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := decompressLZMA(stream, make([]byte, 32))
+			require.Error(t, err)
+			assert.ErrorIs(t, err, errUPXInvalidLZMAParams)
+		})
+	}
 }
+
+func TestDecompressLZMA_LiteralBitBudgetAllowsRealValues(t *testing.T) {
+	// UPX emits lc=3/lp=0, and the budget must stay clear of anything real. lc+lp at exactly the cap is
+	// accepted (it fails later on the stream contents, not on the parameters).
+	stream := []byte{0x02, 0x44, 0x00, 0x00} // lc = 4, lp = 4, sum = 8
+	err := decompressLZMA(stream, make([]byte, 32))
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, errUPXInvalidLZMAParams, "the cap itself must not reject lc+lp == the cap")
+}
+
+func TestUnfilter49(t *testing.T) {
+	// the CTO filter stores CALL/JMP operands big-endian with cto8 as a marker byte. Reversing it must
+	// restore the little-endian relative address: 0x12345678 - (pos+1) - (cto8<<24) at pos 0.
+	const cto8 = 0x12
+	data := []byte{0xE8, cto8, 0x34, 0x56, 0x78}
+	unfilter49(data, cto8)
+	assert.Equal(t, []byte{0xE8, 0x77, 0x56, 0x34, 0x00}, data)
+}
+
+func TestUnfilter49_LeavesUnmarkedBytesAlone(t *testing.T) {
+	// a CALL whose next byte is not the cto8 marker was not transformed by the filter, so it must be
+	// left exactly as-is.
+	data := []byte{0xE8, 0x99, 0x34, 0x56, 0x78}
+	want := slicesClone(data)
+	unfilter49(data, 0x12)
+	assert.Equal(t, want, data)
+}
+
+func slicesClone(b []byte) []byte { return append([]byte(nil), b...) }
 
 func TestParseUPXInfo_ImplausibleHeader(t *testing.T) {
 	// a coincidental "UPX!" match surrounded by zeroed fields must not be accepted as a real UPX header.
-	build := func(version, format byte, blockSize uint32) []byte {
+	build := func(version, format byte, originalSize, blockSize uint32) []byte {
 		lInfo := []byte{0, 0, 0, 0, 'U', 'P', 'X', '!', 0, 0, version, format}
 		pInfo := make([]byte, 12)
-		binary.LittleEndian.PutUint32(pInfo[4:8], 0x1000) // plausible p_filesize
+		binary.LittleEndian.PutUint32(pInfo[4:8], originalSize)
 		binary.LittleEndian.PutUint32(pInfo[8:12], blockSize)
 		return append(append(append([]byte{}, lInfo...), pInfo...), make([]byte, 32)...)
 	}
 
 	cases := map[string][]byte{
-		"zero version":    build(0, 22, 0x1000),
-		"zero format":     build(14, 0, 0x1000),
-		"zero block size": build(14, 22, 0),
+		"zero version":               build(0, 22, 0x1000, 0x1000),
+		"zero format":                build(14, 0, 0x1000, 0x1000),
+		"zero block size":            build(14, 22, 0x1000, 0),
+		"zero original size":         build(14, 22, 0, 0x1000),
+		"original size over ceiling": build(14, 22, maxUPXOriginalSize+1, 0x1000),
+		// p_blocksize comes from a PT_LOAD inside the original file, so it can never exceed p_filesize.
+		// Without this the per-block check compares two values the attacker picked.
+		"block size over original size": build(14, 22, 0x1000, 0x2000),
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
 			_, err := parseUPXInfo(bytes.NewReader(data))
 			require.Error(t, err)
+			assert.ErrorIs(t, err, errUPXImplausibleHeader)
 		})
 	}
 }
 
-func TestParseUPXInfo_OriginalSizeBoundedByInputSize(t *testing.T) {
-	// the absolute ceiling is unrelated to the file on disk, so on its own a few dozen header bytes can
-	// claim it. This is the amplification the reporter measured, expressed as a ratio rather than an
-	// absolute size.
-	data := append(buildUPXHeader(maxUPXOriginalSize, 4096), make([]byte, 32)...)
+func TestParseUPXInfo_HighExpansionAccepted(t *testing.T) {
+	// regression: a bound on p_filesize relative to the input size rejects real binaries. LZMA encodes a
+	// run of N identical bytes in O(log N), so a `go:embed` of 120MB of zeros packs 127504546 bytes into
+	// 608940, a 209x ratio, and `upx --best --lzma` produces exactly that. Only the absolute ceiling and
+	// the per-block budget may bound this value.
+	data := append(buildUPXHeader(127504546, 126628216), make([]byte, 32)...)
 
-	_, err := parseUPXInfo(bytes.NewReader(data))
-	require.Error(t, err)
-	assert.ErrorIs(t, err, errUPXImplausibleSize)
+	info, err := parseUPXInfo(bytes.NewReader(data))
+	require.NoError(t, err, "a high but legitimate expansion ratio must not be rejected")
+	assert.Equal(t, uint32(127504546), info.originalSize)
 }
 
-func TestParseUPXInfo_RatioAllowsRealisticExpansion(t *testing.T) {
-	// a claim within the ratio must still parse. The real fixture expands 1.96x; 4x here stays well inside
-	// the bound so a legitimately compressible binary is not rejected.
-	data := append(buildUPXHeader(4096, 4096), make([]byte, 1024)...)
-	require.Greater(t, len(data), 4096/maxUPXExpansionRatio)
+func TestParseUPXInfo_AtCeilingAccepted(t *testing.T) {
+	// the ceiling itself is legal; only values past it are not.
+	data := append(buildUPXHeader(maxUPXOriginalSize, maxUPXOriginalSize), make([]byte, 32)...)
 
 	info, err := parseUPXInfo(bytes.NewReader(data))
 	require.NoError(t, err)
-	assert.Equal(t, uint32(4096), info.originalSize)
+	assert.Equal(t, uint32(maxUPXOriginalSize), info.originalSize)
 }
 
 // TestGetBuildInfo_MaliciousUPXRejected exercises the entry point the reported vulnerability was reachable
@@ -284,18 +358,9 @@ func TestGetBuildInfo_MaliciousUPXRejected(t *testing.T) {
 
 	require.True(t, isUPXCompressed(bytes.NewReader(data)), "fixture must reach the UPX path")
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		bi, err := getBuildInfo(bytes.NewReader(data), file.NewLocation("/malicious"))
-		// no packages, and an error rather than a panic or a fatal allocation
-		assert.Nil(t, bi)
-		assert.Error(t, err)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("getBuildInfo did not return promptly on a malicious UPX file")
-	}
+	// go's own test timeout covers "did not return promptly"; a goroutine plus time.After here would
+	// assert on an already-finished test if it ever fired.
+	bi, err := getBuildInfo(bytes.NewReader(data), file.NewLocation("/malicious"))
+	assert.Nil(t, bi)
+	assert.Error(t, err)
 }
