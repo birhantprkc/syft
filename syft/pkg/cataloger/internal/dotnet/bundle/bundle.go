@@ -1,6 +1,7 @@
 package bundle
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,31 @@ var dotNetBundleSignature = []byte{
 	0x72, 0x7b, 0x93, 0x02, 0x14, 0xd7, 0xa0, 0x32,
 	0x13, 0xf5, 0xb9, 0xe6, 0xef, 0xae, 0x33, 0x18,
 	0xee, 0x3b, 0x2d, 0xce, 0x24, 0xb3, 0x6a, 0xae,
+}
+
+// FindSignatureOffset searches the start of r for the .NET single-file bundle signature and returns the
+// bundle header offset stored in the 8 bytes immediately before it, or 0 if the signature is not found.
+//
+// searchLimit is where the caller's format parsing says the executable structure ends, which is as far
+// into the file as the marker can be. It is only a search window: it comes from user-controlled header
+// fields and may describe far more than the file holds, or overflow negative, but nothing is sized from
+// it. The buffer grows to what the file actually yields, and a non-positive limit reads nothing.
+func FindSignatureOffset(r io.ReadSeeker, searchLimit int64) (int64, error) {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	searchData, err := io.ReadAll(io.LimitReader(r, searchLimit))
+	if err != nil {
+		return 0, err
+	}
+
+	idx := bytes.Index(searchData, dotNetBundleSignature)
+	if idx == -1 || idx < 8 {
+		return 0, nil
+	}
+
+	return int64(binary.LittleEndian.Uint64(searchData[idx-8 : idx])), nil
 }
 
 // dotNetBundleHeader represents the fixed portion of the bundle header (version 1+)

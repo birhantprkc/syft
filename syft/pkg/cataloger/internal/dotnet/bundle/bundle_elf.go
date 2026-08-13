@@ -1,11 +1,7 @@
 package bundle
 
 import (
-	"bytes"
 	"debug/elf"
-	"encoding/binary"
-	"errors"
-	"io"
 
 	"github.com/anchore/syft/syft/internal/unionreader"
 )
@@ -26,38 +22,7 @@ func findBundleHeaderOffsetInELF(r unionreader.UnionReader) (int64, error) {
 		return 0, nil
 	}
 
-	elfEndOffset := calculateELFEndOffset(elfFile)
-	if elfEndOffset == 0 {
-		return 0, nil
-	}
-
-	// clamp to the actual file size so a malformed ELF (with bogus segment/section
-	// offsets+sizes) can't drive an arbitrarily large allocation below.
-	fileSize, err := r.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, err
-	}
-	if elfEndOffset > fileSize {
-		elfEndOffset = fileSize
-	}
-
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return 0, err
-	}
-
-	searchData := make([]byte, elfEndOffset)
-	n, err := io.ReadFull(r, searchData)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return 0, err
-	}
-	searchData = searchData[:n]
-
-	idx := bytes.Index(searchData, dotNetBundleSignature)
-	if idx == -1 || idx < 8 {
-		return 0, nil
-	}
-
-	return int64(binary.LittleEndian.Uint64(searchData[idx-8 : idx])), nil
+	return FindSignatureOffset(r, calculateELFEndOffset(elfFile))
 }
 
 func calculateELFEndOffset(f *elf.File) int64 {
